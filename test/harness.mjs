@@ -1,644 +1,635 @@
-// test/harness.mjs
-// 心动模式模组的本地回路：用假的 folium / internals / 网易后端驱动真实代码，检查队列行为。
+// harness.mjs — 用假的 Folium 1.7 宿主跑真正的模组代码。
 //
-// v1.3.0 的模型是「整个队列由模组接管」：开启后队列只有 [当前歌, 喜欢, 推荐, 推荐, 喜欢, …]，
-// 用户原来的队列只留一份快照。所以这一版断言的铁律是：
-//   1) 队列里永远不出现重复 key（宿主切歌靠 findIndex，重复 key 就是掉回原列表的根因）；
-//   2) 队首之外永远只有本会话的喜欢歌和推荐歌，原队列的其它歌一首都不许冒出来；
-//   3) 播放顺序永远是 1 喜欢 + 2 推荐，一组接一组，放多久都不会断。
+// 这里不 mock 模组自己的任何函数：加载的就是发布出去的那份 client.mjs / queue.mjs / recommend.mjs，
+// 只有宿主那一侧（playback / events / omni / experimental / storage / ui / registries）是假的。
+// 断言分两类：
+//   - 行为：点了立刻有反应、1 喜欢 + 2 推荐一组接一组、永远不落回原歌单、退出还原、崩溃还原；
+//   - 契约：只调公开接口、不读凭据、队列里不出现重复身份、被宿主拒绝时说实话。
+//
 // 跑法：node test/harness.mjs
-import assert from 'node:assert/strict';
-import activate from '../client.mjs';
-import {
-    appendGroup,
-    buildHeartbeatQueue,
-    countOwnedAhead,
-    hasOwned,
-    playbackKey,
-    restoreQueue,
-} from '../queue.mjs';
 
-const song = (id, providerId = 'netease') => ({
-    id,
-    name: `Song ${id}`,
-    artists: [{ id: 1, name: 'Artist' }],
-    album: { id: 2, name: 'Album' },
-    durationMs: 180000,
-    sourceRef: { kind: 'online', providerId, mediaId: String(id) },
-});
+import { pathToFileURL, fileURLToPath } from 'node:url';
+import path from 'node:path';
 
-const idsOf = (queue) => queue.map((entry) => entry?.id);
-const keysOf = (queue) => queue.map((entry) => playbackKey(entry));
+// replaceQueue 在宿主里有「每秒一次」的限制，模组会自己等。测试里让时钟走得快一点，测试才不会跑三十秒。
+const realNow = Date.now;
+let skew = 0;
+Date.now = () => realNow() + (skew += 5000);
 
-const tick = (ms = 30) => new Promise((resolve) => setTimeout(resolve, ms));
+// ------------------------------------------------------------------ 假 DOM
 
-const heartbeatPayload = (...ids) => ({ code: 200, data: ids.map((id) => ({ songInfo: { id } })) });
+class FakeElement {
+    constructor(tag) {
+        this.tagName = tag;
+        this.style = {};
+        this.attributes = {};
+        this.children = [];
+        this.listeners = {};
+        this.parent = null;
+        this.title = '';
+        this.type = '';
+    }
+    setAttribute(name, value) { this.attributes[name] = String(value); }
+    getAttribute(name) { return this.attributes[name] ?? null; }
+    appendChild(child) { child.parent = this; this.children.push(child); return child; }
+    replaceChildren(...children) { for (const child of children) child.parent = this; this.children = children; }
+    remove() {
+        if (!this.parent) return;
+        this.parent.children = this.parent.children.filter((child) => child !== this);
+        this.parent = null;
+    }
+    addEventListener(type, handler) { (this.listeners[type] ??= []).push(handler); }
+    click() { for (const handler of this.listeners.click ?? []) handler({ stopPropagation() {} }); }
+}
 
-/** 按顺序一次回 N 首，给完就空（模拟 count 被忽略、上游每次只给一首）。 */
-const sequenceEndpoint = (...ids) => {
-    let index = 0;
-    return () => (index < ids.length ? heartbeatPayload(ids[index++]) : heartbeatPayload());
+globalThis.document = { createElement: (tag) => new FakeElement(tag) };
+
+// ------------------------------------------------------------------ 歌与歌单
+
+const CATALOG = new Map();
+let catalogSeq = 0;
+
+const song = (id, extra = {}) => {
+    const key = String(id);
+    if (!CATALOG.has(key)) {
+        CATALOG.set(key, {
+            source: 'netease',
+            id: key,
+            ref: `ref:${key}`,
+            title: `歌 ${key}`,
+            artist: '测试歌手',
+            album: '测试专辑',
+            durationMs: 180000,
+            ...extra,
+        });
+    }
+    return CATALOG.get(key);
 };
 
-/** 每次回两首（模拟 count 生效）：101/102、103/104…… */
-const pairEndpoint = (startId = 101) => {
-    let next = startId;
-    return () => {
-        const payload = heartbeatPayload(next, next + 1);
-        next += 2;
-        return payload;
+const PLAYLIST_IDS = ['1000', '1001', '1002', '1003', '1004', '1005', '1006', '1007', '1008', '1009'];
+const LIKED_IDS = ['2000', '2001', '2002', '2003', '2004', '2005', '2006', '2007', '2008', '2009'];
+const FM_IDS = ['9000', '9001', '9002', '9003', '9004', '9005'];
+
+const keyOf = (entry) => `${entry?.source ?? ''}\u0000${entry?.id ?? ''}`;
+
+// ------------------------------------------------------------------ 假宿主
+
+/**
+ * @param {object} [options]
+ * @param {string} [options.current] 当前歌 id
+ * @param {boolean} [options.loggedIn] 网易云是否登录
+ * @param {boolean} [options.likedEmpty] 「我喜欢的音乐」是否为空
+ * @param {'off'|'all'|'one'} [options.loopMode] 播放器的循环模式
+ * @param {'similar'|'heartbeat'|'none'} [options.recommend] 推荐接口给什么
+ */
+const createHost = (options = {}) => {
+    const current = options.current ?? PLAYLIST_IDS[0];
+    const host = {
+        queue: PLAYLIST_IDS.map((id) => song(id)),
+        currentKey: keyOf(song(current)),
+        version: 1,
+        kind: 'queue',
+        loopMode: options.loopMode ?? 'all',
+        lastReplaceAt: 0,
+        refusals: [],
     };
-};
-
-/** 每次只回一首、编号递增（模拟 count 被忽略但上游愿意一首一首给）。 */
-const onePerCallEndpoint = (startId = 101) => {
-    let next = startId;
-    return () => heartbeatPayload(next++);
-};
-
-/** 每次都回同一首（模拟上游去重后原地打转）。 */
-const stuckEndpoint = (id = 101) => () => heartbeatPayload(id);
-
-/** 最小 DOM：模组的进度条按钮只会用到这几个方法。 */
-const createElement = (tagName) => {
-    const element = {
-        tagName,
-        children: [],
-        attributes: {},
-        listeners: {},
-        style: { cssText: '' },
-        textContent: '',
-        ownerDocument: null,
-        appendChild(child) { child.parent = element; element.children.push(child); return child; },
-        replaceChildren(...nodes) { element.children.forEach((child) => { child.parent = null; }); element.children = nodes; nodes.forEach((node) => { node.parent = element; }); },
-        setAttribute(name, value) { element.attributes[name] = String(value); },
-        addEventListener(type, handler) { element.listeners[type] = handler; },
-        removeEventListener(type) { delete element.listeners[type]; },
-        remove() {
-            if (element.parent) {
-                element.parent.children = element.parent.children.filter((child) => child !== element);
-                element.parent = null;
-            }
-            element.removed = true;
-        },
-        click() { element.listeners.click?.({ preventDefault() {}, stopPropagation() {} }); },
-    };
-    element.ownerDocument = { createElement };
-    return element;
-};
-
-const stubProgressContext = {
-    getColors: () => ({ fill: '#ffffff', track: '#000000', text: '#ffffff' }),
-    subscribe: () => () => {},
-};
-
-/** 最小 zustand 形状的 store：getState / setState / subscribe，够模组用。 */
-const createStore = (initial) => {
-    let state = initial;
-    const listeners = new Set();
-    const setState = (patch) => {
-        state = { ...state, ...(typeof patch === 'function' ? patch(state) : patch) };
-        for (const listener of [...listeners]) listener(state);
-    };
-    return {
-        getState: () => state,
-        setState,
-        subscribe: (listener) => {
-            listeners.add(listener);
-            return () => listeners.delete(listener);
-        },
-    };
-};
-
-const LIKED_BASE = { providerId: 'netease', id: 'liked-1', name: '我喜欢的音乐', type: 'playlist', isLiked: true };
-const SNAPSHOT_KEY = 'folia:heartbeat-mode:snapshot';
-
-const createEnv = (options = {}) => {
-    const {
-        port = 3000,
-        cookie = 'session-cookie',
-        loggedIn = true,
-        currentSong = song(12),
-        queue = [song(11), song(12), song(13)],
-        fmMode = false,
-        likedSongs = [21, 22, 23, 24, 25, 26, 27, 28, 29, 30].map((id) => song(id)),
-        likedTotal = likedSongs.length,
-        endpoint = () => heartbeatPayload(),
-        details = {},
-        offShelf = [],
-        fm = [],
-        hasBridge = true,
-        snapshot = null,
-    } = options;
-
-    globalThis.window = hasBridge ? { electron: { getNeteasePort: async () => port } } : {};
-
-    // 模组只用 getItem/setItem/removeItem，用 Map 撑起来就好。
-    const storage = new Map();
-    if (cookie) storage.set('online_provider:netease:cookie', cookie);
-    if (snapshot) storage.set(SNAPSHOT_KEY, JSON.stringify(snapshot));
-    globalThis.localStorage = {
-        getItem: (key) => (storage.has(key) ? storage.get(key) : null),
-        setItem: (key, value) => { storage.set(key, String(value)); },
-        removeItem: (key) => { storage.delete(key); },
-    };
-
     const toasts = [];
     const logs = [];
-    const fetchCalls = [];
-    const pageCalls = [];
-    const commands = new Map();
-    const controlButtons = new Map();
+    const backendCalls = [];
+    const events = new Map();
+    const storage = new Map();
+    const buttons = [];
+    const commands = [];
+    let recSeq = 0;
+    let fmSeq = 0;
 
-    const store = createStore({
-        currentSong,
-        playQueue: [...queue],
-        isFmMode: fmMode,
-        setPlayQueue(next) {
-            store.setState((state) => ({ playQueue: typeof next === 'function' ? next(state.playQueue) : next }));
-        },
-        setIsFmMode(next) {
-            store.setState({ isFmMode: Boolean(next) });
-        },
-    });
+    const emit = (type, payload) => {
+        for (const handler of [...(events.get(type) ?? [])]) handler(payload);
+    };
 
-    let fmIndex = 0;
-    const liked = { ...LIKED_BASE, trackCount: likedTotal };
+    /** 推荐池：每次给出一批新的推荐 id，测试里认得出来。 */
+    const nextRecIds = (count) => {
+        const ids = [];
+        for (let index = 0; index < count; index += 1) {
+            recSeq += 1;
+            ids.push(song(`5000${recSeq}`).id);
+        }
+        return ids;
+    };
 
-    const omni = {
-        getProviderSummaries: () => [{
-            providerId: 'netease',
-            status: loggedIn ? 'authenticated' : 'anonymous',
-            user: loggedIn ? { id: 7, nickname: 'Listener' } : null,
-            collections: loggedIn ? [liked] : [],
-        }],
-        getProviderUserPlaylists: async () => ({ items: [liked], hasMore: false, nextOffset: 1 }),
-        getCollectionTracks: async (_collection, page = {}) => {
-            const limit = Number(page.limit) || 50;
-            const offset = Number(page.offset) || 0;
-            pageCalls.push({ limit, offset });
-            const items = likedSongs.slice(offset, offset + limit);
-            return { items, hasMore: offset + items.length < likedSongs.length, nextOffset: offset + items.length };
-        },
-        getSongDetail: async (_providerId, id) => details[id] ?? song(id),
-        getSongAvailability: (entry) => (offShelf.includes(Number(entry.id)) ? { state: 'unavailable', reason: 'taken-down' } : { state: 'playable' }),
-        getPersonalFm: async () => {
-            if (fmIndex >= fm.length) return [];
-            const entry = fm[fmIndex];
-            fmIndex += 1;
-            return Array.isArray(entry) ? entry : [entry];
-        },
+    /** 假后端：和宿主一样，被拒绝时用错误码说话。 */
+    const backend = async (endpoint) => {
+        backendCalls.push({ endpoint });
+        switch (endpoint) {
+            case 'likelist': {
+                if (options.loggedIn === false) {
+                    throw Object.assign(new Error('not signed in'), { code: 'not-signed-in' });
+                }
+                return { status: 200, body: { ids: options.likedEmpty ? [] : LIKED_IDS.map((id) => song(id).id) } };
+            }
+            case 'simi_song': {
+                if (options.recommend === 'none') return { status: 200, body: { songs: [] } };
+                return { status: 200, body: { songs: nextRecIds(4) } };
+            }
+            case 'personal_fm': {
+                const id = FM_IDS[fmSeq];
+                fmSeq += 1;
+                return { status: 200, body: { data: id ? [{ id: song(id).id }] : [] } };
+            }
+            case 'playmode_intelligence_list': {
+                if (options.recommend === 'heartbeat') return { status: 200, body: { data: nextRecIds(2) } };
+                throw Object.assign(new Error('endpoint is not allowed'), { code: 'endpoint-denied' });
+            }
+            default:
+                throw Object.assign(new Error(`unknown endpoint ${endpoint}`), { code: 'endpoint-denied' });
+        }
     };
 
     const folium = {
-        modId: 'heartbeat-mode',
-        host: { folium: { major: 1, minor: 4 }, folia: '0.7.18' },
-        env: { context: 'main' },
-        log: {
-            info: (message, meta) => logs.push({ level: 'info', message, meta }),
-            warn: (message, meta) => logs.push({ level: 'warn', message, meta }),
-            error: (message, meta) => logs.push({ level: 'error', message, meta }),
+        host: {
+            folia: '0.7.23',
+            folium: { major: 1, minor: 7 },
+            permissions: ['playback.queue', 'filesystem.data', 'platform.netease.read'],
         },
-        registries: {
-            commands: {
-                register: (def) => {
-                    commands.set(def.id, def);
-                    return { id: def.id, unregister: () => commands.delete(def.id) };
+        log: {
+            info: (message, detail) => logs.push({ level: 'info', message, detail }),
+            warn: (message, detail) => logs.push({ level: 'warn', message, detail }),
+            error: (message, detail) => logs.push({ level: 'error', message, detail }),
+        },
+        events: {
+            on: (type, handler) => {
+                const set = events.get(type) ?? new Set();
+                set.add(handler);
+                events.set(type, set);
+                return () => set.delete(handler);
+            },
+        },
+        playback: {
+            getState: () => ({
+                song: host.queue.find((entry) => keyOf(entry) === host.currentKey) ?? null,
+                status: 'playing',
+            }),
+            getLoopMode: () => host.loopMode,
+            getQueue: ({ offset = 0, limit = 500 } = {}) => ({
+                items: host.queue.slice(offset, offset + limit).map((entry, index) => ({ song: entry, index: offset + index })),
+                length: host.queue.length,
+                currentIndex: host.queue.findIndex((entry) => keyOf(entry) === host.currentKey),
+                kind: host.kind,
+                version: host.version,
+            }),
+            replaceQueue: async (songs, { expectedVersion } = {}) => {
+                if (expectedVersion !== undefined && expectedVersion !== host.version) {
+                    host.refusals.push('stale-version');
+                    return { status: 'refused', reason: 'stale-version' };
+                }
+                if (!Array.isArray(songs) || songs.length === 0) {
+                    host.refusals.push('empty');
+                    return { status: 'refused', reason: 'empty' };
+                }
+                for (const entry of songs) {
+                    if (!entry || !entry.source || !entry.id) {
+                        throw new TypeError('replaceQueue: 歌必须带 source 和 id');
+                    }
+                    if (!entry.ref) {
+                        throw new TypeError(`replaceQueue: ${entry.id} 的 ref 不在本次会话里`);
+                    }
+                }
+                host.queue = [...songs];
+                host.version += 1;
+                host.lastReplaceAt = Date.now();
+                emit('playback.queueChanged', {
+                    kind: 'queue',
+                    length: host.queue.length,
+                    currentIndex: host.queue.findIndex((entry) => keyOf(entry) === host.currentKey),
+                    version: host.version,
+                    byThisMod: true,
+                });
+                return {
+                    status: 'replaced',
+                    kind: 'queue',
+                    length: host.queue.length,
+                    currentIndex: host.queue.findIndex((entry) => keyOf(entry) === host.currentKey),
+                    version: host.version,
+                };
+            },
+        },
+        omni: {
+            resolveSongs: async (keys) => keys.map((key) => {
+                const found = CATALOG.get(String(key?.id));
+                return found
+                    ? { status: 'found', requested: key, song: found }
+                    : { status: 'missing', requested: key };
+            }),
+        },
+        experimental: {
+            'platform.raw': {
+                request: async (provider, endpoint, params = {}) => {
+                    if (provider !== 'netease') {
+                        throw Object.assign(new Error('provider'), { code: 'unsupported' });
+                    }
+                    void params;
+                    return backend(endpoint);
                 },
             },
-            controlButtons: {
-                register: (def) => {
-                    controlButtons.set(def.id, def);
-                    return { id: def.id, unregister: () => controlButtons.delete(def.id) };
-                },
-            },
+        },
+        storage: {
+            get: async (key) => storage.get(key),
+            set: async (key, value) => { storage.set(key, value); },
+            delete: async (key) => { storage.delete(key); },
         },
         ui: {
-            toast: (message, config) => toasts.push({ message, ...(config ?? {}) }),
-            icon: async (name) => (name === 'heart-pulse' ? createElement('svg') : null),
+            toast: (message, settings = {}) => toasts.push({ message, type: settings.type ?? 'info' }),
+            icon: async () => new FakeElement('svg'),
         },
-        net: {
-            fetch: async (url) => {
-                fetchCalls.push(String(url));
-                const payload = await endpoint(String(url), fetchCalls.length);
-                if (typeof payload === 'string') return { status: 404, ok: false, text: () => payload };
-                return { status: 200, ok: true, text: () => JSON.stringify(payload) };
-            },
+        registries: {
+            progressButtons: { register: (definition) => { buttons.push(definition); return () => {}; } },
+            commands: { register: (definition) => { commands.push(definition); return () => {}; } },
         },
-        internals: { stores: { playback: store }, omni },
     };
 
-    return {
-        folium, store, omni, liked, likedSongs,
-        toasts, logs, fetchCalls, pageCalls, commands, controlButtons,
+    const env = {
+        folium,
+        host,
+        toasts,
+        logs,
+        backendCalls,
         storage,
-        snapshotValue: () => {
-            const raw = storage.get(SNAPSHOT_KEY);
-            return raw ? JSON.parse(raw) : null;
+        buttons,
+        commands,
+        /** 装一个按钮，返回它。 */
+        mountButton() {
+            const definition = buttons.find((entry) => entry.id === 'toggle');
+            if (!definition) throw new Error('模组没有注册 toggle 按钮');
+            const container = new FakeElement('div');
+            const cleanups = [];
+            const done = definition.mount(container, {
+                getColors: () => ({ text: '#f8fafc', fill: '#ec4899' }),
+                onChange: (painter) => { cleanups.push(painter); return () => {}; },
+            });
+            return { button: container.children[0], container, unmount: done };
         },
+        /** 模拟用户点「下一首」。 */
+        async advance() {
+            const index = host.queue.findIndex((entry) => keyOf(entry) === host.currentKey);
+            const next = host.loopMode === 'all'
+                ? host.queue[(index + 1) % host.queue.length]
+                : host.queue[index + 1];
+            if (!next) return false;
+            host.currentKey = keyOf(next);
+            emit('playback.songChanged', { song: next, previousSong: null, reason: 'auto' });
+            return true;
+        },
+        /** 模拟「别人」整条换掉队列（用户拖了一个歌单、别的模组、宿主的撤销）。 */
+        replaceExternally(songs) {
+            host.queue = [...songs];
+            host.version += 1;
+            host.currentKey = keyOf(host.queue[0]);
+            host.lastReplaceAt = Date.now();
+            emit('playback.queueChanged', {
+                kind: 'queue',
+                length: host.queue.length,
+                currentIndex: 0,
+                version: host.version,
+                byThisMod: false,
+            });
+        },
+        snapshot: () => storage.get('queue-snapshot') ?? null,
     };
+
+    return env;
 };
 
-const runStart = (env) => env.commands.get('start').run({ values: {} });
-const runStop = (env) => env.commands.get('stop').run({ values: {} });
-
-const mountButton = (env) => {
-    const container = createElement('div');
-    env.controlButtons.get('toggle').mount(container, stubProgressContext);
-    return { container, button: container.children[0] };
+const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
+const loadMod = async (folium) => {
+    const url = pathToFileURL(path.join(MODULE_DIR, '..', 'client.mjs'));
+    url.search = `?t=${(catalogSeq += 1)}`;
+    const module = await import(url.href);
+    return module.default(folium);
 };
 
-/** 队列不变量：key 唯一、非队首的歌全是本会话的喜欢（21-30）或推荐（>=101）。 */
-const assertHeartbeatQueue = (queue, likedIds = [21, 22, 23, 24, 25, 26, 27, 28, 29, 30]) => {
-    const keys = keysOf(queue);
-    assert.equal(new Set(keys).size, keys.length, `队列里出现重复 key：${keys.join(' , ')}`);
-    for (const entry of queue.slice(1)) {
-        const id = Number(entry.id);
-        const ok = likedIds.includes(id) || id >= 101;
-        assert.ok(ok, `队首之外混进了非心动歌曲：${entry.id}`);
-    }
+/** 等异步流程跑完。 */
+const settle = async (rounds = 12) => {
+    for (let round = 0; round < rounds; round += 1) await new Promise((resolve) => setImmediate(resolve));
 };
 
-/** 模拟宿主往下播一首：把 currentSong 设成队列里当前歌的下一首，并返回它。 */
-const playNext = (env) => {
-    const state = env.store.getState();
-    const index = state.playQueue.findIndex((entry) => playbackKey(entry) === playbackKey(state.currentSong));
-    assert.ok(index >= 0, '当前歌应该还在队列里');
-    const next = state.playQueue[index + 1];
-    assert.ok(next, '当前歌后面应该还有歌（跑道不能断）');
-    env.store.setState({ currentSong: next });
-    return next;
-};
+// ------------------------------------------------------------------ 断言与跑测
 
+let failures = 0;
 const tests = [];
-const test = (name, fn) => tests.push({ name, fn });
+const test = (name, run) => tests.push({ name, run });
 
-// ---------------------------------------------------------------- queue.mjs 单元
+const assert = {
+    ok(value, message) {
+        if (!value) throw new Error(message ?? '断言失败');
+    },
+    equal(actual, expected, message) {
+        if (actual !== expected) throw new Error(`${message ?? '不相等'}：实际 ${JSON.stringify(actual)}，期望 ${JSON.stringify(expected)}`);
+    },
+    deepEqual(actual, expected, message) {
+        const left = JSON.stringify(actual);
+        const right = JSON.stringify(expected);
+        if (left !== right) throw new Error(`${message ?? '不相等'}：实际 ${left}，期望 ${right}`);
+    },
+    includes(list, value, message) {
+        if (!list.includes(value)) throw new Error(`${message ?? '不在列表里'}：${JSON.stringify(value)} 不在 ${JSON.stringify(list)}`);
+    },
+};
 
-test('queue.playbackKey：在线/本地/舞台/Navidrome 与宿主的 key 规则一致', () => {
-    assert.equal(playbackKey(song(42)), 'online:netease:42');
-    assert.equal(playbackKey({ id: 42, sourceRef: { kind: 'online', providerId: 'qobuz', mediaId: 'abc' } }), 'online:qobuz:abc');
-    assert.equal(playbackKey({ id: 9, sourceRef: { kind: 'local', mediaId: 'L9' } }), 'local:L9');
-    assert.equal(playbackKey({ id: 9, isStage: true }), 'stage:9');
-    assert.equal(playbackKey({ id: 9, isLocal: true, localRef: { songId: 'L9' } }), 'local:L9');
-    assert.equal(playbackKey({ id: 9, isNavidrome: true, navidromeData: { id: 'N9' } }), 'navidrome:N9');
-    // 没有 isNavidrome 标记的 navidromeData 宿主不会当 Navidrome 认，这里跟宿主保持一致。
-    assert.equal(playbackKey({ id: 9, navidromeData: { id: 'N9' } }), 'online:netease:9');
-    assert.equal(playbackKey({ id: 42 }), 'online:netease:42', '老数据没有 sourceRef 也按网易云算');
-    assert.equal(playbackKey(null), '');
-});
+const toastTexts = (env) => env.toasts.map((entry) => entry.message);
 
-test('queue：队列拼装、补组、跑道计数、还原', () => {
-    const a = song(1);
-    const b = song(2);
-    assert.deepEqual(idsOf(buildHeartbeatQueue(a, [b])), [1, 2]);
-    assert.deepEqual(idsOf(buildHeartbeatQueue(null, [b])), [2], '没有在播的歌时不硬塞队首');
-    assert.deepEqual(idsOf(appendGroup([a], [b])), [1, 2]);
-    const queue = [a, b];
-    assert.equal(countOwnedAhead(queue, a), 1);
-    assert.equal(countOwnedAhead(queue, b), 0);
-    assert.equal(countOwnedAhead(queue, song(99)), 2, '当前歌不在队列里时整条都算「后面」');
-    assert.equal(countOwnedAhead([], a), 0);
-    assert.equal(hasOwned(queue, new Set(['online:netease:2'])), true);
-    assert.equal(hasOwned(queue, new Set(['online:netease:3'])), false);
-
-    // 还原：从开启时正在放的那首之后接起。
-    const snapshot = [song(11), song(12), song(13)];
-    assert.deepEqual(idsOf(restoreQueue(song(12), snapshot, song(12))), [13, 11, 12]);
-    // 当前歌（心动歌）不在快照里：前置，后面接锚点之后的歌。
-    assert.deepEqual(idsOf(restoreQueue(song(101), snapshot, song(12))), [101, 13, 11, 12]);
-    // 锚点也找不到：原样还回去。
-    assert.deepEqual(idsOf(restoreQueue(song(101), snapshot, song(77))), [101, 11, 12, 13]);
-    assert.deepEqual(idsOf(restoreQueue(song(101), [], null)), [101]);
-});
-
-// ---------------------------------------------------------------- 开启
-
-test('开启：点击立刻进入准备中，成功后整条队列被接管（当前歌 + 1 喜欢 + 2 推荐…）', async () => {
-    const env = createEnv({ endpoint: pairEndpoint(101) });
-    activate(env.folium);
-    const { button } = mountButton(env);
-
-    button.click();
-    // 还没等任何接口返回，按钮就应该已经变了：这是「点了没反应」的正面用例。
-    assert.equal(button.attributes['aria-busy'], 'true', '点击后同步进入 busy');
-    assert.match(button.title, /正在准备/);
-    assert.match(env.toasts.at(-1).message, /正在挑选/);
-
-    await tick(120);
-
-    const ids = idsOf(env.store.getState().playQueue);
-    assert.equal(ids[0], 12, '队首还是正在放的那首');
-    assert.ok(env.likedSongs.some((entry) => entry.id === ids[1]), '第一首是随机的喜欢');
-    assert.deepEqual(ids.slice(2, 4), [101, 102], '后两首是推荐');
-    assert.equal(ids.length, 10, '跑道补满 3 组（1 + 9）');
-    assert.ok(!ids.includes(11) && !ids.includes(13), '用户原队列的歌被整体换出去了');
-    assertHeartbeatQueue(env.store.getState().playQueue);
-    assert.equal(button.attributes['aria-busy'], 'false');
-    assert.equal(button.attributes['aria-pressed'], 'true');
-    assert.match(button.title, /退出心动模式/);
-    assert.match(env.toasts.at(-1).message, /1 首喜欢的歌 \+ 2 首推荐/);
-    assert.ok(env.snapshotValue(), '原队列存进快照，退出/重启时还要还原');
-
-    const url = env.fetchCalls[0];
-    assert.match(url, /\/playmode\/intelligence\/list/);
-    assert.match(url, new RegExp(`[?&]id=${ids[1]}\\b`), '用随机喜欢的那首当种子');
-    assert.match(url, new RegExp(`[?&]sid=${ids[1]}\\b`));
-    assert.match(url, /[?&]pid=liked-1\b/);
-    assert.match(url, /[?&]cookie=session-cookie\b/);
-    assert.match(url, /[?&]count=2\b/);
-});
-
-test('私人 FM 模式下开启：先切回普通队列，FM 分支才不会绕开心动队列', async () => {
-    const env = createEnv({ fmMode: true, endpoint: pairEndpoint(101) });
-    activate(env.folium);
-    await runStart(env);
-    await tick(80);
-    assert.equal(env.store.getState().isFmMode, false);
-    const ids = idsOf(env.store.getState().playQueue);
-    assert.equal(ids[0], 12);
-    assert.deepEqual(ids.slice(2, 4), [101, 102]);
-    assert.ok(!ids.includes(11) && !ids.includes(13));
-});
-
-test('准备中再点一下：立刻取消，队列一动不动', async () => {
-    let release;
-    const gate = new Promise((resolve) => { release = resolve; });
-    const env = createEnv({ endpoint: () => gate.then(() => heartbeatPayload(101, 102)) });
-    activate(env.folium);
-    const { button } = mountButton(env);
-
-    button.click();
-    assert.equal(button.attributes['aria-busy'], 'true');
-    button.click();   // 第二下：取消
-    assert.equal(button.attributes['aria-busy'], 'false', '取消也是同步生效');
-    assert.match(env.toasts.at(-1).message, /已取消/);
-    assert.deepEqual(idsOf(env.store.getState().playQueue), [11, 12, 13]);
-
-    release();        // 让被取消的那次准备流程走完
-    await tick(80);
-    assert.deepEqual(idsOf(env.store.getState().playQueue), [11, 12, 13], '取消后接口回来也不许动队列');
-    assert.equal(env.snapshotValue(), null, '取消也要把快照清掉');
-    assert.equal(await runStop(env), '心动模式没有在运行');
-});
-
-// ---------------------------------------------------------------- 无限循环（核心）
-
-test('无限循环：一直播下去永远是 1 喜欢 + 2 推荐，绝不掉回原喜欢列表', async () => {
-    const env = createEnv({
-        endpoint: pairEndpoint(101),
-        // 用户当前队列就是「我喜欢的音乐」本身：这正是之前出 bug 的场景。
-        queue: [21, 22, 23, 24, 25, 26, 27, 28, 29, 30].map((id) => song(id)),
-        currentSong: song(25),
-    });
-    activate(env.folium);
-    await runStart(env);
-    await tick(120);
-
-    const played = [25];
-    for (let step = 0; step < 30; step += 1) {
-        const queue = env.store.getState().playQueue;
-        assertHeartbeatQueue(queue);
-        assert.equal(new Set(idsOf(queue)).size, idsOf(queue).length, '同一首歌不许在队列里出现两次');
-        const next = playNext(env);
-        played.push(next.id);
-        await tick(40);   // 给 runway 一点补组时间
+const hasDuplicate = (songs) => {
+    const seen = new Set();
+    for (const entry of songs) {
+        const key = keyOf(entry);
+        if (seen.has(key)) return entry.id;
+        seen.add(key);
     }
+    return null;
+};
 
-    // 播放顺序：1 喜欢 + 2 推荐，一组接一组。
-    for (let index = 1; index < played.length; index += 1) {
-        const id = played[index];
-        const positionInGroup = (index - 1) % 3;
-        if (positionInGroup === 0) {
-            assert.ok([21, 22, 23, 24, 25, 26, 27, 28, 29, 30].includes(id), `第 ${index} 首应该是喜欢的歌，实际 ${id}`);
-        } else {
-            assert.ok(id >= 101, `第 ${index} 首应该是推荐，实际 ${id}`);
+/** 当前歌之后必须一组一组是「1 喜欢 + 2 推荐」，而且整条队列没有重复身份。 */
+const checkPattern = (env, recIds) => {
+    const ids = env.host.queue.map((entry) => entry.id);
+    const currentIndex = env.host.queue.findIndex((entry) => keyOf(entry) === env.host.currentKey);
+    const ahead = ids.slice(currentIndex + 1);
+    for (let at = 0; at < ahead.length; at += 3) {
+        const group = ahead.slice(at, at + 3);
+        if (group.length === 0) break;
+        assert.includes(LIKED_IDS, group[0], `第 ${at / 3 + 1} 组的开头不是「我喜欢的音乐」：${ids.join(',')}`);
+        assert.equal(group.length, 3, `有一组不完整：${ids.join(',')}`);
+        for (const id of group.slice(1)) {
+            assert.ok(recIds.has(id), `第 ${at / 3 + 1} 组里出现了不认识的车牌：${id}`);
         }
     }
-    // 原队列里除了正在放的那首（25），其它歌只可能以「心动喜欢的歌」的身份重新出现，
-    // 不可能夹带着原列表顺序回来——这一点由每拍的 assertHeartbeatQueue（key 唯一）兜住。
-    const finalQueue = env.store.getState().playQueue;
-    assert.ok(finalQueue.length <= 24, `队列不该无限变长（现在 ${finalQueue.length} 首）`);
-    assert.ok(countOwnedAhead(finalQueue, env.store.getState().currentSong) >= 1, '跑道不能空');
+    const duplicate = hasDuplicate(env.host.queue);
+    assert.ok(!duplicate, `队列里出现了重复的歌：${duplicate}`);
+};
+
+// ------------------------------------------------------------------ 测
+
+test('点击之后立刻有反应：准备中的状态是同步画上去的', async () => {
+    const env = createHost({ current: '1000' });
+    await loadMod(env.folium);
+    const { button } = env.mountButton();
+    assert.equal(button.getAttribute('aria-pressed'), 'false', '初始状态应该是未开启');
+
+    button.click();
+    // 一行 await 都没有：此刻按钮必须已经是「准备中」，而不是等接口回来才变。
+    assert.equal(button.getAttribute('aria-busy'), 'true', '点击之后按钮没有立刻进入准备中');
+    assert.ok(button.title.includes('取消'), `标题没变：${button.title}`);
+    assert.equal(toastTexts(env).at(-1), '正在准备心动模式…（再点一次取消）');
+
+    await settle();
+    assert.equal(button.getAttribute('aria-busy'), 'false');
+    assert.equal(button.getAttribute('aria-pressed'), 'true');
 });
 
-test('跑道：当前歌后面始终保持至少 9 首心动歌', async () => {
-    const env = createEnv({ endpoint: pairEndpoint(101) });
-    activate(env.folium);
-    await runStart(env);
-    await tick(120);
-    assert.ok(countOwnedAhead(env.store.getState().playQueue, env.store.getState().currentSong) >= 9);
+test('第一组 = 一首喜欢 + 两首推荐，跑道补到两组', async () => {
+    const env = createHost({ current: '1000' });
+    await loadMod(env.folium);
+    const { button } = env.mountButton();
+    button.click();
+    await settle();
 
-    playNext(env);
-    await tick(80);
-    playNext(env);
-    await tick(80);
-    const ahead = countOwnedAhead(env.store.getState().playQueue, env.store.getState().currentSong);
-    assert.ok(ahead >= 9, `切歌后跑道要立刻补回 9 首，实际 ${ahead}`);
+    const ids = env.host.queue.map((entry) => entry.id);
+    assert.equal(ids[0], '1000', '当前歌应该在队首');
+    assert.includes(LIKED_IDS, ids[1], '第二位应该是「我喜欢的音乐」');
+    assert.ok(ids[2].startsWith('5000') && ids[3].startsWith('5000'), `第三、四位应该是推荐：${ids.join(',')}`);
+    assert.includes(LIKED_IDS, ids[4], '第二组又从一首喜欢开始');
+    assert.equal(ids.length, 7, `跑道应该补到两组（1 + 2×3）：${ids.join(',')}`);
+    assert.ok(toastTexts(env).includes('心动模式已开启：一首喜欢的歌 + 两首推荐，之后一直循环下去'));
 });
 
-// ---------------------------------------------------------------- 推荐接口的兼容
+test('连着唱三十首也不落回原歌单：一直是 1 喜欢 + 2 推荐', async () => {
+    const env = createHost({ current: '1000' });
+    await loadMod(env.folium);
+    const { button } = env.mountButton();
+    button.click();
+    await settle();
 
-test('老后端忽略 count（一次只回一首）：补第二次，一组仍然凑够两首推荐', async () => {
-    const env = createEnv({ endpoint: onePerCallEndpoint(101) });
-    activate(env.folium);
-    await runStart(env);
-    await tick(120);
-    const ids = idsOf(env.store.getState().playQueue);
-    assert.deepEqual(ids.slice(2, 4), [101, 102], '两首推荐都拿到了');
-    assert.ok(env.fetchCalls.length >= 2, '打了两次接口');
-    assert.match(env.fetchCalls[0], /[?&]count=2\b/);
-    assert.match(env.fetchCalls[1], /[?&]count=1\b/, '第二次只要缺的那一首');
+    const recIds = new Set();
+    const collect = () => {
+        for (const entry of env.host.queue) if (entry.id.startsWith('5000') || FM_IDS.includes(entry.id)) recIds.add(entry.id);
+    };
+    collect();
+
+    for (let step = 0; step < 30; step += 1) {
+        await env.advance();
+        await settle();
+        const ids = env.host.queue.map((entry) => entry.id);
+        const leaked = ids.filter((id) => PLAYLIST_IDS.includes(id) && id !== '1000');
+        assert.ok(leaked.length === 0, `第 ${step} 步落回了原歌单：${ids.join(',')}`);
+        collect();
+    }
+    checkPattern(env, recIds);
 });
 
-test('上游一直回同一首：不再重复打接口，用私人 FM 补第二首', async () => {
-    const env = createEnv({ endpoint: stuckEndpoint(101), fm: [[song(301)]] });
-    activate(env.folium);
-    await runStart(env);
-    await tick(120);
-    const ids = idsOf(env.store.getState().playQueue);
-    assert.deepEqual(ids.slice(2, 4), [101, 301]);
-    // 第一首 101 之后上游一直重复，最多打 MAX_REC_CALLS=3 次就收手（含后续补组，放宽到 4）。
-    assert.ok(env.fetchCalls.length <= 4, `不该无限重试，实际 ${env.fetchCalls.length} 次`);
+test('准备中再点一次就是取消：队列一动不动', async () => {
+    const env = createHost({ current: '1000' });
+    await loadMod(env.folium);
+    const { button } = env.mountButton();
+    button.click();
+    button.click();                      // 第二下落在准备中
+    await settle();
+    assert.deepEqual(env.host.queue.map((entry) => entry.id), PLAYLIST_IDS, '取消之后队列被动了');
+    assert.equal(button.getAttribute('aria-pressed'), 'false');
+    assert.ok(toastTexts(env).includes('已取消'));
 });
 
-test('心动接口不可用（非 JSON）：私人 FM 顶上', async () => {
-    const env = createEnv({ endpoint: () => '<html>502</html>', fm: [[song(301), song(302)]] });
-    activate(env.folium);
-    await runStart(env);
-    await tick(120);
-    const ids = idsOf(env.store.getState().playQueue);
-    assert.deepEqual(ids.slice(2, 4), [301, 302]);
+test('退出心动模式：队列放回原样，从退出时正在放的那首之后接回来', async () => {
+    const env = createHost({ current: '1000' });
+    await loadMod(env.folium);
+    const { button } = env.mountButton();
+    button.click();
+    await settle();
+    for (let step = 0; step < 3; step += 1) { await env.advance(); await settle(); }
+
+    const playing = env.host.queue.find((entry) => keyOf(entry) === env.host.currentKey);
+    button.click();
+    await settle();
+    const ids = env.host.queue.map((entry) => entry.id);
+    assert.equal(ids[0], playing.id, '退出的那一刻正在放的歌应该在队首');
+    // 正在放的可能是一首模组放进去的歌：它留着当队首，原歌单应该一首不少地接在后面。
+    assert.deepEqual([...ids].sort(), [...[...PLAYLIST_IDS, playing.id]].sort(), `原队列的歌不一样：${ids.join(',')}`);
+    assert.deepEqual(ids.slice(1), PLAYLIST_IDS, `应该从开启时那首之后接回来：${ids.join(',')}`);
+    assert.equal(env.snapshot(), null, '退出之后快照应该清掉');
+    assert.equal(button.getAttribute('aria-pressed'), 'false');
 });
 
-test('接口和私人 FM 都给不出歌：开启失败，队列一动不动', async () => {
-    const env = createEnv({ endpoint: () => heartbeatPayload() });
-    activate(env.folium);
-    const { button } = mountButton(env);
-    const result = await runStart(env);
-    assert.match(String(result), /没有给出推荐/);
-    assert.match(env.toasts.at(-1).message, /没有给出推荐/);
-    assert.deepEqual(idsOf(env.store.getState().playQueue), [11, 12, 13]);
-    assert.equal(env.snapshotValue(), null);
-    assert.equal(button.attributes['aria-pressed'], 'false', '失败后按钮回到空闲');
+test('用户自己换了队列：模组让路，不把队列抢回去', async () => {
+    const env = createHost({ current: '1000' });
+    await loadMod(env.folium);
+    const { button } = env.mountButton();
+    button.click();
+    await settle();
+
+    const mine = ['7000', '7001'].map((id) => song(id));
+    env.replaceExternally(mine);
+    await settle();
+    assert.deepEqual(env.host.queue.map((entry) => entry.id), ['7000', '7001'], '模组把用户的队列抢回去了');
+    assert.equal(button.getAttribute('aria-pressed'), 'false', '按钮应该回到未开启');
+    assert.equal(env.snapshot(), null);
 });
 
-test('推荐里混着下架歌曲：跳过下架那首，仍然凑两首能播的', async () => {
-    const env = createEnv({ endpoint: pairEndpoint(101), offShelf: [102] });
-    activate(env.folium);
-    await runStart(env);
-    await tick(120);
-    const ids = idsOf(env.store.getState().playQueue);
-    assert.deepEqual(ids.slice(2, 4), [101, 103]);
+test('没登录网易云：说清楚要登录，队列不动', async () => {
+    const env = createHost({ current: '1000', loggedIn: false });
+    await loadMod(env.folium);
+    const { button } = env.mountButton();
+    button.click();
+    await settle();
+    assert.deepEqual(env.host.queue.map((entry) => entry.id), PLAYLIST_IDS);
+    assert.ok(toastTexts(env).some((text) => text.includes('登录网易云')), `提示不对：${toastTexts(env)}`);
+    assert.equal(button.getAttribute('aria-pressed'), 'false');
 });
 
-test('当前歌不是网易云的：照样接管队列，队首保留它', async () => {
-    const env = createEnv({
-        currentSong: song('K1', 'kugou'),
-        queue: [song(11), song('K1', 'kugou'), song(13)],
-        endpoint: pairEndpoint(101),
+test('「我喜欢的音乐」是空的：说清楚，队列不动', async () => {
+    const env = createHost({ current: '1000', likedEmpty: true });
+    await loadMod(env.folium);
+    const { button } = env.mountButton();
+    button.click();
+    await settle();
+    assert.deepEqual(env.host.queue.map((entry) => entry.id), PLAYLIST_IDS);
+    assert.ok(toastTexts(env).some((text) => text.includes('登录网易云')));
+});
+
+test('心动接口还没开放时静默改用相似歌曲，只抱怨一次', async () => {
+    const env = createHost({ current: '1000' });
+    await loadMod(env.folium);
+    const { button } = env.mountButton();
+    button.click();
+    await settle();
+    for (let step = 0; step < 2; step += 1) { await env.advance(); await settle(); }
+
+    const denied = env.logs.filter((entry) => String(entry.message).includes('心动接口'));
+    assert.equal(denied.length, 1, `应该只说一次：${denied.length}`);
+    assert.ok(env.backendCalls.some((call) => call.endpoint === 'simi_song'), '没有走相似歌曲');
+    assert.ok(toastTexts(env).includes('心动模式已开启：一首喜欢的歌 + 两首推荐，之后一直循环下去'));
+});
+
+test('心动接口在宿主里放行后直接用心动推荐', async () => {
+    const env = createHost({ current: '1000', recommend: 'heartbeat' });
+    await loadMod(env.folium);
+    const { button } = env.mountButton();
+    button.click();
+    await settle();
+    assert.ok(env.backendCalls.some((call) => call.endpoint === 'playmode_intelligence_list'), '没有试心动接口');
+    assert.ok(!env.backendCalls.some((call) => call.endpoint === 'simi_song'), '心动能用时不该走相似歌曲');
+});
+
+test('推荐拿不到时用私人 FM 兜底', async () => {
+    const env = createHost({ current: '1000', recommend: 'none' });
+    await loadMod(env.folium);
+    const { button } = env.mountButton();
+    button.click();
+    await settle();
+    const ids = env.host.queue.map((entry) => entry.id);
+    assert.ok(env.backendCalls.some((call) => call.endpoint === 'personal_fm'), '没有试私人 FM');
+    assert.ok(ids.slice(2).some((id) => FM_IDS.includes(id)), `兜底应该来自私人 FM：${ids.join(',')}`);
+});
+
+test('单曲循环时提醒一句，但照样能开', async () => {
+    const env = createHost({ current: '1000', loopMode: 'one' });
+    await loadMod(env.folium);
+    const { button } = env.mountButton();
+    button.click();
+    await settle();
+    assert.ok(toastTexts(env).some((text) => text.includes('单曲循环')), `提示里没有单曲循环：${toastTexts(env)}`);
+    assert.equal(env.host.queue.length, 7, '单曲循环不影响开启：还是当前歌 + 两组');
+});
+
+test('上次没退出就关了 Folia：下次启动把队列放回去', async () => {
+    const env = createHost({ current: '1000' });
+    const owned = ['2000', '50001', '50002'];
+    env.storage.set('queue-snapshot', {
+        version: 1,
+        anchor: ['netease', '1000'],
+        songs: PLAYLIST_IDS.map((id) => ['netease', id]),
+        owned: owned.map((id) => ['netease', id]),
+        savedAt: realNow(),
     });
-    activate(env.folium);
-    await runStart(env);
-    await tick(120);
-    const queue = env.store.getState().playQueue;
-    assert.equal(queue[0].id, 'K1');
-    assert.notEqual(playbackKey(queue[0]), playbackKey(queue[1]));
-    assertHeartbeatQueue(queue);
+    env.host.queue = ['1000', ...owned].map((id) => song(id));
+    env.host.currentKey = keyOf(song('50001'));
+    env.host.version += 1;
+
+    await loadMod(env.folium);
+    await settle(40);
+    const ids = env.host.queue.map((entry) => entry.id);
+    // 正在放的那首本就是模组放进去的：留着当队首，其余原歌单要一首不少地回来。
+    assert.deepEqual([...ids].sort(), [...[...PLAYLIST_IDS, '50001']].sort(), `原队列没回来：${ids.join(',')}`);
+    assert.equal(ids[0], '50001', '正在放的那首应该还在队首');
+    assert.deepEqual(ids.slice(1), PLAYLIST_IDS, `应该从开启时那首之后接回来：${ids.join(',')}`);
+    void owned;
+    assert.equal(env.snapshot(), null, '还原之后快照应该清掉');
 });
 
-// ---------------------------------------------------------------- 前置条件
-
-test('没登录 / 没在播的歌：给出提示且不动队列', async () => {
-    const anonymous = createEnv({ loggedIn: false });
-    activate(anonymous.folium);
-    assert.match(String(await runStart(anonymous)), /登录/);
-    assert.deepEqual(idsOf(anonymous.store.getState().playQueue), [11, 12, 13]);
-
-    const idle = createEnv({ currentSong: null, queue: [] });
-    activate(idle.folium);
-    assert.match(String(await runStart(idle)), /没有在播的歌/);
-});
-
-// ---------------------------------------------------------------- 退出 / 还原
-
-test('退出：恢复开启前的队列，从开启时那首的后面接起，移除心动歌', async () => {
-    const env = createEnv({ endpoint: pairEndpoint(101), currentSong: song(12), queue: [11, 12, 13].map((id) => song(id)) });
-    activate(env.folium);
-    await runStart(env);
-    await tick(120);
-    const playing = playNext(env);   // 播到第一首喜欢
-    await tick(40);
-
-    const result = await runStop(env);
-    assert.match(String(result), /已退出/);
-    // restoreQueue(当前歌, [11,12,13], 锚点 12) → [当前歌, 13, 11, 12]
-    const ids = idsOf(env.store.getState().playQueue);
-    assert.equal(ids.length, 4);
-    assert.equal(ids[0], playing.id, '当前正在放的那首留着，不打断播放');
-    assert.deepEqual(ids.slice(1), [13, 11, 12], '原来的队列按锚点之后接回去');
-    assert.equal(env.snapshotValue(), null, '退出后快照要清掉');
-    assert.match(env.toasts.at(-1).message, /恢复开启前的队列/);
-    assert.equal(await runStop(env), '心动模式没有在运行');
-});
-
-test('进度条按钮：开着的时候再点一下就是退出并还原；停用模组也还原', async () => {
-    const env = createEnv({ endpoint: pairEndpoint(101) });
-    const dispose = activate(env.folium);
-    const { button } = mountButton(env);
+test('停用模组：队列放回去，之后不再动它', async () => {
+    const env = createHost({ current: '1000' });
+    const dispose = await loadMod(env.folium);
+    const { button } = env.mountButton();
     button.click();
-    await tick(120);
-    assert.equal(button.attributes['aria-pressed'], 'true');
+    await settle();
+    assert.equal(env.host.queue.length, 7, '开启之后应该是当前歌 + 两组');
 
-    button.click();
-    await tick(40);
-    assert.equal(button.attributes['aria-pressed'], 'false');
-    const ids = idsOf(env.store.getState().playQueue);
-    assert.deepEqual([...ids].sort((a, b) => Number(a) - Number(b)), [11, 12, 13]);
-
-    // 再开一次，然后直接停用模组
-    await runStart(env);
-    await tick(120);
-    assert.equal(env.store.getState().playQueue.length > 3, true);
     dispose();
-    await tick(40);
-    const restored = idsOf(env.store.getState().playQueue);
-    assert.equal(restored.includes(101), false, '停用后不许留下心动歌');
-    assert.ok(restored.length >= 3);
+    await settle();
+    const left = env.host.queue.map((entry) => entry.id);
+    assert.deepEqual([...left].sort(), [...PLAYLIST_IDS].sort(), `停用之后队列没放回去：${left.join(',')}`);
+    assert.equal(env.storage.size, 0, '停用之后快照应该清掉');
+    const before = env.host.queue.length;
+    for (let step = 0; step < 4; step += 1) { await env.advance(); await settle(); }
+    assert.equal(env.host.queue.length, before, '停用之后还在往队列里加歌');
 });
 
-test('用户自己换了队列：心动模式自动收摊，尊重用户的新队列', async () => {
-    const env = createEnv({ endpoint: pairEndpoint(101) });
-    activate(env.folium);
-    const { button } = mountButton(env);
-    await runStart(env);
-    await tick(120);
-    assert.equal(button.attributes['aria-pressed'], 'true');
+test('快照跟着补组一起长大：崩机之后每一首模组放进去的歌都认得出来', async () => {
+    const env = createHost({ current: '1000' });
+    await loadMod(env.folium);
+    const { button } = env.mountButton();
+    button.click();
+    await settle();
+    await env.advance();
+    await settle();
 
-    env.store.getState().setPlayQueue([song(31), song(32)]);
-    env.store.setState({ currentSong: song(31) });
-    await tick(60);
-
-    assert.deepEqual(idsOf(env.store.getState().playQueue), [31, 32], '用户的新队列不许被改');
-    assert.equal(button.attributes['aria-pressed'], 'false', '按钮回空闲');
-    assert.equal(env.snapshotValue(), null);
-    assert.match(env.toasts.at(-1).message, /已退出/);
-});
-
-test('宿主被关掉后重开：用快照把队列还原，别把心动歌留在「我喜欢的音乐」里', async () => {
-    const env = createEnv({
-        snapshot: [song(11), song(12), song(13)],
-        currentSong: song(12),
-        queue: [song(12), song(21), song(101), song(102)],
-        endpoint: pairEndpoint(101),
-    });
-    activate(env.folium);
-    await tick(1600);   // 700ms 换回去，再看一拍确认宿主没抢回去才收快照
-    assert.deepEqual(idsOf(env.store.getState().playQueue), [11, 12, 13]);
-    assert.equal(env.snapshotValue(), null, '还原成功后快照就该收掉');
-
-    // 还原之后用户点开启，一样正常工作。
-    await runStart(env);
-    await tick(120);
-    const ids = idsOf(env.store.getState().playQueue);
-    assert.equal(ids[0], 12);
-    assert.ok(env.likedSongs.some((entry) => entry.id === ids[1]));
-    assert.deepEqual(ids.slice(2, 4), [101, 102]);
-});
-
-// ---------------------------------------------------------------- 随机抽歌
-
-test('喜欢的歌很多：随机翻页，不会永远从第一首开始', async () => {
-    const many = Array.from({ length: 200 }, (_value, index) => song(1000 + index));
-    const env = createEnv({ likedSongs: many, likedTotal: 200, endpoint: pairEndpoint(101) });
-    const originalRandom = Math.random;
-    Math.random = () => 0.99;   // 固定随机数：offset 应该落在 150
-    try {
-        activate(env.folium);
-        await runStart(env);
-        await tick(120);
-    } finally {
-        Math.random = originalRandom;
+    const record = env.snapshot();
+    assert.ok(record, '没有写快照');
+    const owned = record.owned.map((pair) => pair[1]);
+    for (const entry of env.host.queue.slice(1)) {
+        assert.includes(owned, entry.id, `队列里的 ${entry.id} 不在快照里：${owned.join(',')}`);
     }
-    assert.equal(env.pageCalls[0].limit, 50);
-    // randomInt(200-50+1) = floor(0.99 * 151) = 149
-    assert.equal(env.pageCalls[0].offset, 149, '随机 offset 落在 total-50 之内');
-    const ids = idsOf(env.store.getState().playQueue);
-    assert.ok(ids[1] >= 1149, `喜欢取自随机那一页，实际 ${ids[1]}`);
 });
 
-// ---------------------------------------------------------------- 跑
+test('队列读了两页也能补齐（长歌单不丢歌）', async () => {
+    const env = createHost({ current: '1000' });
+    // 造一条超过 500 首的队列，逼模组分页读。
+    env.host.queue = Array.from({ length: 640 }, (_, index) => song(`8${String(index).padStart(3, '0')}`));
+    env.host.currentKey = keyOf(env.host.queue[0]);
+    const dispose = await loadMod(env.folium);
+    const { button } = env.mountButton();
+    button.click();
+    await settle();
+    assert.equal(env.host.queue[0].id, env.host.queue[0].id);
+    assert.ok(env.host.queue.length > 0);
+    const ids = env.host.queue.map((entry) => entry.id);
+    assert.equal(ids[0], '8000', `当前歌应该还在队首：${ids.slice(0, 3).join(',')}`);
+    assert.equal(new Set(ids).size, ids.length, '分页读的时候把队列读坏了');
+    dispose();
+    await settle();
+});
 
-let failed = 0;
-for (const { name, fn } of tests) {
-    try {
-        await fn();
-        console.log(`ok   ${name}`);
-    } catch (error) {
-        failed += 1;
-        console.log(`FAIL ${name}`);
-        console.log(`     ${error?.message}`);
+// ------------------------------------------------------------------ 跑
+
+const run = async () => {
+    for (const entry of tests) {
+        try {
+            await entry.run();
+            console.log(`  ok    ${entry.name}`);
+        } catch (error) {
+            failures += 1;
+            console.log(`  FAIL  ${entry.name}`);
+            console.log(`        ${error?.message ?? error}`);
+        }
     }
-}
-console.log(`\n${tests.length - failed}/${tests.length} 通过`);
-if (failed > 0) process.exitCode = 1;
+    console.log(`\n${tests.length - failures}/${tests.length} 通过`);
+    if (failures > 0) process.exitCode = 1;
+};
+
+await run();
