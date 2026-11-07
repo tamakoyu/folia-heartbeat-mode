@@ -301,7 +301,7 @@ const createHost = (options = {}) => {
 
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const loadMod = async (folium) => {
-    const url = pathToFileURL(path.join(MODULE_DIR, '..', 'client.mjs'));
+    const url = pathToFileURL(path.join(MODULE_DIR, '..', 'mods', 'heartbeat-mode', 'client.mjs'));
     url.search = `?t=${(catalogSeq += 1)}`;
     const module = await import(url.href);
     return module.default(folium);

@@ -1,11 +1,11 @@
 # 心动模式（Folia 模组）
 
-![心动模式](preview.jpg)
+![心动模式](mods/heartbeat-mode/preview.jpg)
 
 把网易云的**心动模式**接进 Folia：随机抽一首「我喜欢的音乐」当种子，接两首推荐，一组接一组无限
 循环；整条播放队列由模组按公开接口接管，退出、停用或重开 Folia 时自动还原你原来的队列。
 
-不改应用、不覆盖安装，模组目录整个丢进 `mods/` 就行。
+不改应用、不覆盖安装，把 `mods/heartbeat-mode/` 丢进模组目录就行。
 
 - 模组 id：`heartbeat-mode`　·　Folium 1　·　需要 Folia `>=0.7.22 <0.8.0`
 - 权限：`playback.queue`、`filesystem.data`、`platform.netease.read`
@@ -25,11 +25,13 @@
 
 **方式一：拖 zip。** 在 [Releases](../../releases) 里下载 `heartbeat-mode.zip`，打开 Folia →「模组」面板 → 拖进去。
 
-**方式二：放目录。** 把这个仓库整个放到模组目录下（目录名随便，身份以 `mod.json` 的 `id` 为准）：
+**方式二：放目录。** 把 `mods/heartbeat-mode/` 放进 Folia 的模组目录（身份以 `mod.json` 的 `id` 为准）：
 
 ```sh
-git clone <本仓库地址> ~/Library/Application\ Support/Folia/mods/heartbeat-mode
-# Windows: %APPDATA%\Folia\mods\heartbeat-mode
+# 克隆到别处，再把模组目录拷进去
+git clone https://github.com/tamakoyu/folia-heartbeat-mode /tmp/heartbeat-mode-src
+cp -R /tmp/heartbeat-mode-src/mods/heartbeat-mode ~/Library/Application\ Support/Folia/mods/
+# Windows: %APPDATA%\Folia\mods\
 ```
 
 然后启用它。首次启用会要求确认：本模组申请了队列接管与自己的数据目录，并选用实验接口
@@ -81,13 +83,20 @@ git clone <本仓库地址> ~/Library/Application\ Support/Folia/mods/heartbeat-
 - 如果你（或别的模组）整条换掉了队列，模组让路：退出但不还原，快照一起清掉。
 - 播放器停在「单曲循环」时不会走队列，模组会提醒一句（那个开关不在公开接口里）。
 
+## 目录结构
+
+```
+mods/heartbeat-mode/   ← 模组本体（mod.json、client.mjs、queue.mjs、recommend.mjs、preview.jpg）
+test/harness.mjs       ← 开发用的测试，不随模组分发、不进签名文件
+```
+
 ## 测试
 
 ```sh
-node test/harness.mjs
+node test/harness.mjs    # 在仓库根目录跑
 ```
 
-用假的 Folium 1.7 宿主跑发布出去的那几个文件，只有宿主那一侧是假的（`playback` / `events` /
+用假的 Folium 1.7 宿主跑发布出去的那几个文件（`mods/heartbeat-mode/` 里的），只有宿主那一侧是假的（`playback` / `events` /
 `omni` / `experimental` / `storage` / `ui` / `registries`）。16 项断言，其中几项是冲着这次的问题去的：
 
 - 点击之后**一行 await 都没有**时就断言按钮已经进入准备中；
