@@ -512,6 +512,11 @@ export default async function activate(folium) {
             button.style.opacity = preparing ? '0.45' : '0.72';
             button.style.cursor = preparing ? 'progress' : 'pointer';
             button.style.transform = preparing ? 'scale(0.9)' : 'scale(1)';
+            if (icon) {
+                // 图标本身是描边画的心：开启之后要填上，不然空心看起来像没生效。
+                icon.style.fill = active ? 'currentColor' : 'none';
+                icon.style.stroke = 'currentColor';
+            }
         };
 
         void folium.ui.icon('heart', { size: 15 }).then((element) => {

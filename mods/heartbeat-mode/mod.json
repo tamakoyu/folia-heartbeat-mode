@@ -2,7 +2,7 @@
   "folium": 1,
   "id": "heartbeat-mode",
   "name": "心动模式",
-  "version": "2.1.0",
+  "version": "2.1.1",
   "author": "tamakoyu",
   "description": "把网易云的「心动模式」搬进 Folia：随机抽一首「我喜欢的音乐」，再向网易云要两首推荐，一组接一组无限循环。只用 Folium 1.7 的公开接口（playback.replaceQueue、platform.raw、omni.resolveSongs、storage），不读宿主凭据。",
   "client": "client.mjs",

@@ -382,6 +382,8 @@ test('点击之后立刻有反应：准备中的状态是同步画上去的', as
     await settle();
     assert.equal(button.getAttribute('aria-busy'), 'false');
     assert.equal(button.getAttribute('aria-pressed'), 'true');
+    const glyph = button.children[0];
+    assert.equal(glyph?.style?.fill, 'currentColor', '开启之后图标应该变成实心（fill: currentColor）');
 });
 
 test('第一组 = 一首喜欢 + 两首推荐，跑道补到两组', async () => {
@@ -468,6 +470,7 @@ test('用户自己换了队列：模组让路，不把队列抢回去', async ()
     await settle();
     assert.deepEqual(env.host.queue.map((entry) => entry.id), ['7000', '7001'], '模组把用户的队列抢回去了');
     assert.equal(button.getAttribute('aria-pressed'), 'false', '按钮应该回到未开启');
+    assert.equal(button.children[0]?.style?.fill, 'none', '退出之后图标应该回到空心');
     assert.equal(env.snapshot(), null);
 });
 
